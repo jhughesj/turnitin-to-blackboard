@@ -16,7 +16,7 @@ Usage:
     python3 rbc_to_bb_prompt.py --gui
 
 Output .txt files are saved alongside each .rbc file.
-Requires Python 3.6+. GUI mode requires tkinter (standard on Mac/Windows installer).
+Requires Python 3.6+. GUI mode requires tkinter (standard on Mac/Windows).
 """
 
 import json
@@ -268,9 +268,10 @@ COLOUR_SUCCESS = "#50fa7b"
 COLOUR_ERROR   = "#ff5555"
 COLOUR_WARN    = "#f1fa8c"
 COLOUR_TEXT    = "#cdd6f4"
-COLOUR_SUBTEXT = "#6c7086"
+COLOUR_SUBTEXT = "#a0a8c0"
 COLOUR_BTN     = "#7c6af7"
 COLOUR_BTN_HOV = "#9d8ff9"
+COLOUR_INPUT   = "#0d0d1a"
 
 
 def run_gui():
@@ -297,14 +298,30 @@ def run_gui():
 
         def _btn(self, parent, text, cmd, secondary=False,
                  font=("Helvetica", 10), pady=6):
-            bg = COLOUR_PANEL if secondary else COLOUR_BTN
-            fg = COLOUR_SUBTEXT if secondary else "white"
-            b  = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                           activebackground=COLOUR_BTN_HOV, activeforeground="white",
-                           font=font, bd=0, padx=12, pady=pady,
-                           cursor="hand2", relief="flat")
-            b.bind("<Enter>", lambda e: b.config(bg=COLOUR_BTN_HOV if not secondary else "#555"))
-            b.bind("<Leave>", lambda e: b.config(bg=bg))
+            bg     = "#3a3a55" if secondary else COLOUR_BTN
+            bg_hov = "#4a4a6a" if secondary else COLOUR_BTN_HOV
+            fg     = COLOUR_TEXT if secondary else "white"
+            # Use Label instead of Button — macOS Aqua cannot override Label colours
+            b = tk.Label(parent, text=text, bg=bg, fg=fg,
+                         font=font, padx=12, pady=pady,
+                         cursor="hand2", relief="flat")
+            b.bind("<Button-1>", lambda e: cmd())
+            b.bind("<Enter>",    lambda e: b.config(bg=bg_hov))
+            b.bind("<Leave>",    lambda e: b.config(bg=bg))
+            # Support .config(state="disabled"/"normal") for Generate button
+            _orig_config = b.config
+            def _patched_config(_b=b, _fg=fg, _cmd=cmd, **kw):
+                if "state" in kw:
+                    state = kw.pop("state")
+                    if state == "disabled":
+                        _b.configure(fg="#555577")
+                        _b.unbind("<Button-1>")
+                    else:
+                        _b.configure(fg=_fg)
+                        _b.bind("<Button-1>", lambda e: _cmd())
+                if kw:
+                    _orig_config(**kw)
+            b.config = _patched_config
             return b
 
         def _build_ui(self):
@@ -335,9 +352,10 @@ def run_gui():
             sb = tk.Scrollbar(lc, bg=COLOUR_PANEL)
             sb.pack(side="right", fill="y")
             self.listbox = tk.Listbox(
-                lc, bg="#12121e", fg=COLOUR_TEXT,
+                lc, bg=COLOUR_INPUT, fg=COLOUR_TEXT,
                 selectbackground=COLOUR_ACCENT, selectforeground="white",
-                font=("Courier", 10), bd=0, highlightthickness=0,
+                font=("Courier", 10), bd=0, highlightthickness=1,
+                highlightbackground=COLOUR_ACCENT, highlightcolor=COLOUR_ACCENT,
                 yscrollcommand=sb.set, activestyle="none")
             self.listbox.pack(fill="both", expand=True)
             sb.config(command=self.listbox.yview)
@@ -363,9 +381,9 @@ def run_gui():
             oi.pack(fill="x", padx=8, pady=6)
             self.out_entry = tk.Entry(
                 oi, textvariable=self.output_dir,
-                bg="#12121e", fg=COLOUR_TEXT, insertbackground=COLOUR_TEXT,
+                bg=COLOUR_INPUT, fg=COLOUR_TEXT, insertbackground=COLOUR_TEXT,
                 font=("Courier", 10), bd=0, highlightthickness=1,
-                highlightcolor=COLOUR_ACCENT, highlightbackground=COLOUR_SUBTEXT,
+                highlightcolor=COLOUR_ACCENT, highlightbackground=COLOUR_ACCENT,
                 relief="flat")
             self.out_entry.pack(side="left", fill="x", expand=True,
                                 ipady=4, padx=(0, 8))
@@ -402,7 +420,7 @@ def run_gui():
             ls = tk.Scrollbar(lf, bg=COLOUR_PANEL)
             ls.pack(side="right", fill="y")
             self.log = tk.Text(
-                lf, height=7, bg="#12121e", fg=COLOUR_TEXT,
+                lf, height=7, bg=COLOUR_INPUT, fg=COLOUR_TEXT,
                 font=("Courier", 9), bd=0, state="disabled",
                 yscrollcommand=ls.set, wrap="word")
             self.log.pack(fill="both", expand=True, padx=8, pady=6)
@@ -503,7 +521,7 @@ def run_gui():
 
             summary = f"Done: {ok} generated" + (f", {err} failed" if err else "")
             self.after(0, self._log, summary, "info" if not err else "err")
-            self.after(0, self.conv_btn.config, {"state": "normal"})
+            self.after(0, lambda: self.conv_btn.config(state="normal"))
             if not err:
                 self.after(0, messagebox.showinfo, "Complete",
                            f"All {ok} prompt file(s) saved.\n\n"
