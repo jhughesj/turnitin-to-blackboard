@@ -35,7 +35,7 @@ Blackboard Ultra now includes an AI Rubric Generator that can create a rubric fr
 **1. Download or clone this repository**
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/rbc_to_bb_prompt.git
+git clone https://github.com/jhughesj/rbc_to_bb_prompt.git
 cd rbc_to_bb_prompt
 ```
 
