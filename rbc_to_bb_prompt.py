@@ -6,8 +6,8 @@ Converts .rbc rubric files into text prompts you can paste into
 Blackboard Ultra's "Generate Rubric" AI description box (~2000 char limit).
 
 The script automatically compresses output to stay under the limit by:
-  1. Trimming long descriptors to key sentences
-  2. Grouping criteria that share identical descriptors
+  1. Including Distinction + Fail descriptors, allocated proportionally by criterion weighting
+  2. Trimming descriptors to key sentences to fit within each criterion's character budget
   3. Removing descriptors entirely as a last resort (criteria names/weights kept)
 
 Usage:
@@ -24,7 +24,7 @@ import os
 import re
 import sys
 import threading
-from collections import defaultdict
+
 
 CHAR_LIMIT = 1900   # Conservative limit below BB's ~2000 cap
 
@@ -38,21 +38,6 @@ def sanitize(text):
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
 
-
-def compress_descriptor(text, max_words):
-    """Trim descriptor to first sentence if it fits, else hard truncate."""
-    if not text:
-        return ""
-    text = sanitize(text)
-    if max_words is None:
-        return text
-    words = text.split()
-    if len(words) <= max_words:
-        return text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    if sentences and len(sentences[0].split()) <= max_words:
-        return sentences[0]
-    return " ".join(words[:max_words]) + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -78,40 +63,224 @@ def _load_rbc(filepath):
     is_form       = scoring_method == 6 or not has_scales
 
     if scale_values:
+        # Sort by position for display order in the prompt
         sorted_sv = sorted(scale_values, key=lambda s: s.get("position", s.get("num", 0)))
         levels    = [s["name"] for s in sorted_sv]
         level_ids = [s["id"]   for s in sorted_sv]
+        # Identify top/fail by actual numeric value - rubrics may sort ascending or descending
+        by_value = sorted(scale_values, key=lambda s: float(s.get("value", 0)))
+        top_id   = by_value[-1]["id"]   # highest value = Distinction
+        fail_id  = by_value[0]["id"]    # lowest value  = Fail
     else:
         levels, level_ids = [], []
+        top_id = fail_id = None
 
-    # Sample 3 representative levels: low / mid / high
-    if level_ids:
-        idxs         = [0, len(levels) // 2, len(levels) - 1]
-        sample_pairs = [(level_ids[i], levels[i]) for i in idxs]
-    else:
-        sample_pairs = []
-
-    # Build per-criterion data including descriptor samples
+    # Build per-criterion data: short desc + full Distinction & Fail descriptors
     crit_blocks = []
     for c in criteria_list:
         cname = sanitize(c.get("name", ""))
         cdesc = sanitize(c.get("description", ""))
         cval  = c.get("value", 0)
-        descs = {}
-        if has_scales and sample_pairs:
+        dist_desc = ""
+        fail_desc = ""
+        if has_scales:
             cs_ids   = c.get("criterion_scales", [])
             cs_objs  = [cs_map[i] for i in cs_ids if i in cs_map]
             sv_to_cs = {cs["scale_value"]: cs for cs in cs_objs}
-            for lvl_id, lvl_name in sample_pairs:
-                descs[lvl_name] = sanitize(sv_to_cs.get(lvl_id, {}).get("description", ""))
-        crit_blocks.append({"name": cname, "desc": cdesc, "value": cval, "descs": descs})
+            if top_id:
+                dist_desc = sanitize(sv_to_cs.get(top_id, {}).get("description", ""))
+            if fail_id:
+                fail_desc = sanitize(sv_to_cs.get(fail_id, {}).get("description", ""))
+        crit_blocks.append({
+            "name": cname, "desc": cdesc, "value": cval,
+            "dist": dist_desc, "fail": fail_desc
+        })
 
-    return rubric_name, rubric_desc, is_form, levels, sample_pairs, crit_blocks
+    return rubric_name, rubric_desc, is_form, levels, crit_blocks
 
 
-def _build_prompt(rubric_name, rubric_desc, is_form, levels, sample_pairs,
-                  crit_blocks, word_limit, group_identical, include_descs):
+# ---------------------------------------------------------------------------
+# Sentence scoring — rewards specific/concrete content over generic quality prose
+# ---------------------------------------------------------------------------
+
+# Signals that indicate a sentence contains a concrete, checkable requirement.
+# Grouped by category for maintainability.
+# Scores: +10 for specific named requirements, +8 for important-but-slightly-broader terms.
+_HIGH_VALUE_SIGNALS = [
+    # Referencing styles — named styles are always high-value
+    "harvard", "apa", "mla", "chicago", "vancouver",
+    # Referencing mechanics
+    "in-text citation", "bibliography", "reference format", "references are",
+    "footnote", "endnote",
+    # Source quality
+    "peer-reviewed", "peer reviewed", "primary source",
+    # Integrity / originality (Turnitin signals)
+    "plagiar", "similarity score", "similarity", "originality",
+    "ai-generated", "generative tool", "ai tool",
+    # Document structure requirements
+    "template", "executive summary", "appendix", "word count", "word limit",
+    # Institutional / regulatory specifics
+    "supervisor", "westminster", "un sdg", "sdgs", " sdg",
+    "gdpr", "data protection", "consent",
+    # Subject-specific terms
+    "knowledge gap", "background/introduction", "future work",
+    "comparing means", "statistical",
+    "past and current perspectives", "problem or knowledge gap",
+    # Audience
+    "non-expert", "lay audience", "non-specialist", "expert audience",
+]
+
+# Medium-value signals — important but broader; each adds +8 instead of +10.
+_MEDIUM_VALUE_SIGNALS = [
+    "image", "visual", "diagram", "figure", "chart", "graph",
+    "table", "screenshot", "illustration",
+]
+
+# Generic sentence openers that add little information value.
+# Each match subtracts 3 from the sentence score.
+_GENERIC_OPENERS = [
+    "the case for support section is",
+    "the technical summary is",
+    "the lay summary is",
+    "the beneficiaries section is",
+    "it demonstrates a high level of",
+    "it shows a strong level of",
+    "it shows effort in",
+    "it lacks the necessary",
+    "the summary provides a",
+    "the section demonstrates",
+    "it does not make sufficient effort",
+    "it demonstrates a moderate level of",
+    # Additional generic quality openers
+    "the response is outstanding",
+    "the response lacks",
+    "the argument is highly coherent",
+    "the argument is unclear",
+    "there is little to no evidence of",
+    "supporting evidence is used",
+    "the answer demonstrates",
+    "the submission demonstrates",
+    "the work demonstrates",
+]
+
+
+def _score_sentence(sentence):
+    """
+    Score a sentence by information density.
+    Higher = more specific/concrete/checkable content.
+    +10 per high-value signal (named requirements, specific terms)
+    +8  per medium-value signal (visual elements, broad but concrete)
+    -3  for generic openers
+    +2  bonus for short sentences (tend to be more specific)
+    """
+    s = sentence.lower()
+    score = 0
+    for sig in _HIGH_VALUE_SIGNALS:
+        if sig in s:
+            score += 10
+    for sig in _MEDIUM_VALUE_SIGNALS:
+        if sig in s:
+            score += 8
+    for opener in _GENERIC_OPENERS:
+        if s.startswith(opener):
+            score -= 3
+            break  # only penalise once
+    # Short sentences tend to be more specific (e.g. "Harvard format required.")
+    if len(sentence) < 60:
+        score += 2
+    return score
+
+
+def _smart_extract(text, max_chars):
+    """
+    Select the highest-scoring sentences from a descriptor that fit within
+    max_chars. Strategy:
+      1. Score all sentences by information density.
+      2. Attempt to include the first sentence as a context anchor ONLY if at
+         least one high-scoring sentence (score > 0) still fits after it.
+         If the anchor would crowd out all high-value content, skip it.
+      3. Fill remaining space with the highest-scoring sentences in order.
+      4. Return sentences in their original order for readability.
+    This ensures high-value specific requirements (Harvard, template, knowledge
+    gap, Westminster/SDGs, references format, supervisor) are never sacrificed
+    for generic quality prose.
+    """
+    if not text or max_chars <= 0:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    if not sentences:
+        return ""
+
+    order = {s: i for i, s in enumerate(sentences)}
+    first = sentences[0]
+    remaining = sentences[1:]
+
+    # Score all non-first sentences
+    scored_remaining = sorted(
+        [(s, _score_sentence(s)) for s in remaining],
+        key=lambda x: (-x[1], order.get(x[0], 999))
+    )
+    high_value = [(s, sc) for s, sc in scored_remaining if sc > 0]
+
+    # Decide whether to include the first sentence as context anchor:
+    # include it only if at least one high-value sentence still fits after it
+    use_anchor = False
+    if len(first) < max_chars:
+        remaining_after_anchor = max_chars - len(first) - 1  # -1 for space
+        if high_value and len(high_value[0][0]) <= remaining_after_anchor:
+            use_anchor = True
+
+    # Build selection
+    selected = []
+    if use_anchor:
+        selected.append(first)
+        used_chars = len(first)
+        pool = scored_remaining  # include all, not just high_value
+    else:
+        used_chars = 0
+        pool = scored_remaining  # start from highest-scoring
+
+    for s, score in pool:
+        if score <= 0 and not use_anchor:
+            continue  # skip generic sentences when no anchor context
+        needed = len(s) + (1 if selected else 0)
+        if used_chars + needed <= max_chars:
+            selected.append(s)
+            used_chars += needed
+
+    # If nothing selected at all, truncate the best sentence available
+    if not selected:
+        best = high_value[0][0] if high_value else first
+        words = best.split()
+        partial = ""
+        for w in words:
+            trial = (partial + " " + w).strip()
+            if len(trial) <= max_chars - 1:
+                partial = trial
+            else:
+                break
+        return (partial + "…") if partial else ""
+
+    # Return in original order
+    selected.sort(key=lambda s: order.get(s, 999))
+    return " ".join(selected)
+
+
+def _build_prompt(rubric_name, rubric_desc, is_form, levels, crit_blocks,
+                  char_limit, include_descs, chars_per_criterion):
+    """
+    Build the prompt. When include_descs=True, append Distinction and Fail
+    descriptors for each criterion. Budget is allocated proportionally by
+    weighting (higher-weighted criteria get more detail). Each criterion's
+    budget is split 60/40 between Distinction and Fail descriptors, giving
+    BB anchors at both ends of the scale.
+    """
     lines = []
+    # Strong naming instruction at the top so it's the first thing BB's AI reads
+    lines.append("CRITICAL: Use the criterion names below EXACTLY as written. "
+                 "Do NOT rephrase, rename, expand, or reword any criterion name.")
+    lines.append("")
     lines.append(f"Please create a rubric titled: {rubric_name}")
     lines.append("")
 
@@ -119,103 +288,189 @@ def _build_prompt(rubric_name, rubric_desc, is_form, levels, sample_pairs,
         lines.append(f"Context: {rubric_desc}")
         lines.append("")
 
-    # Rubric type line
     many_levels = len(levels) > 6
     if is_form:
         lines.append("Rubric type: Percentage-based grading form.")
     elif levels:
+        unique_levels = list(dict.fromkeys(levels))  # deduplicate preserving order
         if many_levels:
+            # Always show range as top-grade to bottom-grade (e.g. Distinction to Fail)
+            # by_value sort puts highest grade last; use that for display order
+            display_first = unique_levels[-1]  # highest grade name
+            display_last  = unique_levels[0]   # lowest grade name
             lines.append(f"Rubric type: Percentage-based with {len(levels)} levels "
-                         f"from {levels[0]} to {levels[-1]}.")
+                         f"from {display_first} to {display_last}.")
         else:
+            # For small sets, list all levels highest-first
             lines.append(f"Rubric type: Percentage-based with {len(levels)} levels: "
-                         f"{', '.join(levels)}.")
+                         f"{', '.join(reversed(unique_levels))}.")
     lines.append("")
     lines.append(f"The rubric must have exactly {len(crit_blocks)} criteria:")
     lines.append("")
 
-    if group_identical and sample_pairs and include_descs:
-        # Group criteria that share identical descriptor text
-        groups = defaultdict(list)
-        for cb in crit_blocks:
-            key = tuple(cb["descs"].get(lvl, "") for _, lvl in sample_pairs)
-            groups[key].append(cb)
+    # Compute per-criterion descriptor budgets.
+    # Base: proportional to weighting (60% dist / 40% fail split).
+    # Targeted boost: Research Q (supervisor) and Presentation (Harvard/template)
+    # have short but critical sentences that get cut under pure proportional
+    # allocation because of their low weighting. We boost their dist budget to
+    # fit their best sentence, funding the boost by trimming the highest-weight
+    # criterion (CFS), but only if the total still fits within chars_per_criterion.
+    BOOST_CRITERIA = {"research q", "presentation"}  # lowercased names to match
 
-        for key, members in groups.items():
-            for cb in members:
-                w = (f" ({int(float(cb['value']))}% weighting)"
-                     if cb["value"] and float(cb["value"]) > 0 else "")
-                lines.append(f"  • {cb['name']}{w}: {cb['desc']}")
-            if any(key):
-                lines.append("  Performance descriptors:")
-                for (_, lvl_name), desc in zip(sample_pairs, key):
-                    if desc:
-                        d = compress_descriptor(desc, word_limit)
-                        lines.append(f"    • {lvl_name}: {d}")
-            lines.append("")
+    if include_descs and chars_per_criterion:
+        total_weight = sum(
+            max(float(cb["value"]), 1) for cb in crit_blocks
+            if cb.get("dist") or cb.get("fail")
+        )
+        total_budget = chars_per_criterion * len(crit_blocks)
 
-    else:
+        # First pass: proportional allocation
+        crit_budgets = {}
         for i, cb in enumerate(crit_blocks, 1):
-            w = (f" ({int(float(cb['value']))}% weighting)"
-                 if cb["value"] and float(cb["value"]) > 0 else "")
-            lines.append(f"{i}. {cb['name']}{w}")
-            if cb["desc"]:
-                lines.append(f"   {cb['desc']}")
-            if include_descs and cb["descs"] and sample_pairs:
-                lines.append("   Performance descriptors:")
-                for _, lvl_name in sample_pairs:
-                    d = cb["descs"].get(lvl_name, "")
-                    if d:
-                        d = compress_descriptor(d, word_limit)
-                        lines.append(f"     • {lvl_name}: {d}")
-            lines.append("")
+            if cb.get("dist") or cb.get("fail"):
+                share = (max(float(cb["value"]), 1) / total_weight) * total_budget
+                crit_budgets[i] = {
+                    "dist": int(share * 0.60),
+                    "fail": int(share * 0.40),
+                }
 
-    lines.append("Important: Use exactly the criteria names and weightings listed above.")
+        # Second pass: targeted boost for Research Q and Presentation
+        import re as _re
+        heaviest_i = max(
+            (i for i in crit_budgets),
+            key=lambda i: float(crit_blocks[i - 1]["value"])
+        )
+        boost_total = 0
+        for i, cb in enumerate(crit_blocks, 1):
+            if i not in crit_budgets or not cb.get("dist"):
+                continue
+            if cb["name"].lower() not in BOOST_CRITERIA:
+                continue
+            sentences = _re.split(r"(?<=[.!?])\s+", cb["dist"].strip())
+            scored = [(s, _score_sentence(s)) for s in sentences]
+            high = [(s, sc) for s, sc in scored if sc > 0]
+            if not high:
+                continue
+            best_s = max(high, key=lambda x: x[1])[0]
+            needed = len(best_s) + 2
+            if needed > crit_budgets[i]["dist"]:
+                boost = needed - crit_budgets[i]["dist"]
+                # Only boost if heaviest can afford it (keep at least 50 chars dist)
+                heaviest_spare = max(0, crit_budgets[heaviest_i]["dist"] - 50)
+                actual_boost = min(boost, heaviest_spare)
+                if actual_boost > 0:
+                    crit_budgets[i]["dist"] += actual_boost
+                    crit_budgets[heaviest_i]["dist"] -= actual_boost
+                    boost_total += actual_boost
+    else:
+        crit_budgets = {}
+
+    # Assemble criteria blocks
+    for i, cb in enumerate(crit_blocks, 1):
+        w = (f" ({int(float(cb['value']))}% weighting)"
+             if cb["value"] and float(cb["value"]) > 0 else "")
+        lines.append(f"{i}. {cb['name']}{w}")
+        if cb["desc"]:
+            # Truncate very long descriptions (e.g. full task instructions) to
+            # keep the prompt within the character limit
+            desc = cb["desc"]
+            if len(desc) > 150:
+                # Try to cut at a sentence boundary within the first 150 chars
+                cut = desc[:150]
+                last_stop = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+                desc = (cut[:last_stop + 1] if last_stop > 60 else cut.rstrip()) + "…"
+            lines.append(f"   {desc}")
+        if crit_budgets.get(i):
+            budget = crit_budgets[i]
+            if cb.get("dist") and budget["dist"] > 20:
+                d = _smart_extract(cb["dist"], budget["dist"])
+                if d:
+                    lines.append(f"   Distinction: {d}")
+            if cb.get("fail") and budget["fail"] > 20:
+                f = _smart_extract(cb["fail"], budget["fail"])
+                if f:
+                    lines.append(f"   Fail: {f}")
+        lines.append("")
+
+    # Strong closing reminder — repeated for emphasis
+    lines.append("IMPORTANT: Criterion names must be copied EXACTLY as listed above. "
+                 "Do not rephrase, rename, or expand them.")
     return "\n".join(lines)
 
 
 def rbc_to_prompt(filepath, char_limit=CHAR_LIMIT):
     """
-    Convert .rbc to BB AI prompt, auto-compressing to stay under char_limit.
+    Convert .rbc to BB AI prompt, maximising use of the char_limit.
+    Strategy:
+      1. Build base prompt (names, weights, short descriptions, strong naming instructions).
+      2. Use remaining characters for Distinction + Fail descriptors, allocated
+         proportionally by criterion weighting (higher weight = more detail).
+         Each criterion's budget is split 60% Distinction / 40% Fail.
+      3. If base alone exceeds limit, fall back to names/weights only.
     Returns (prompt_text, char_count, was_compressed, rubric_name, is_form, n_criteria, n_levels)
     """
-    rubric_name, rubric_desc, is_form, levels, sample_pairs, crit_blocks = _load_rbc(filepath)
+    rubric_name, rubric_desc, is_form, levels, crit_blocks = _load_rbc(filepath)
 
-    # Compression strategies in order: try each until under limit
-    strategies = [
-        dict(word_limit=None, group_identical=False, include_descs=True),   # Full
-        dict(word_limit=50,   group_identical=False, include_descs=True),   # Light trim
-        dict(word_limit=30,   group_identical=False, include_descs=True),   # Medium trim
-        dict(word_limit=50,   group_identical=True,  include_descs=True),   # Group + light trim
-        dict(word_limit=25,   group_identical=True,  include_descs=True),   # Group + medium trim
-        dict(word_limit=15,   group_identical=True,  include_descs=True),   # Group + hard trim
-        dict(word_limit=None, group_identical=False, include_descs=False),  # No descriptors
-    ]
+    # Step 1: build base prompt with no descriptors
+    base_prompt = _build_prompt(
+        rubric_name, rubric_desc, is_form, levels, crit_blocks,
+        char_limit, include_descs=False, chars_per_criterion=0
+    )
 
-    for s in strategies:
-        prompt = _build_prompt(
-            rubric_name, rubric_desc, is_form, levels, sample_pairs, crit_blocks,
-            s["word_limit"], s["group_identical"], s["include_descs"]
-        )
-        compressed = s["word_limit"] is not None or s["group_identical"] or not s["include_descs"]
-        if len(prompt) <= char_limit:
-            return prompt, len(prompt), compressed, rubric_name, is_form, len(crit_blocks), len(levels)
+    if len(base_prompt) > char_limit:
+        # Base prompt (names + descriptions, no level descriptors) already exceeds limit.
+        # This happens when a rubric has many criteria with very long descriptions
+        # (e.g. full coursework task instructions used as criterion descriptions).
+        # Return a warning prompt explaining the situation rather than an unusable
+        # truncated fragment.
+        n = len(crit_blocks)
+        total_desc_chars = sum(len(cb.get("desc", "")) for cb in crit_blocks)
+        lines = [
+            f"WARNING: This rubric ({rubric_name!r}) cannot be automatically converted "
+            f"to a Blackboard AI prompt.",
+            "",
+            f"Reason: The rubric has {n} criteria whose descriptions total "
+            f"{total_desc_chars:,} characters. Even with no level descriptors, "
+            f"the prompt exceeds Blackboard's ~{char_limit:,} character limit.",
+            "",
+            "Suggested actions:",
+            "  1. Use Blackboard's rubric editor directly to create this rubric manually.",
+            "  2. If the criterion descriptions contain full task instructions, consider",
+            "     whether a simpler rubric structure is appropriate for Blackboard.",
+            f"  3. The rubric has {n} criteria — Blackboard AI works best with 10 or fewer.",
+            "",
+            "Criterion names for reference:",
+        ]
+        for i, cb in enumerate(crit_blocks, 1):
+            w = f" ({int(float(cb['value']))}%)" if cb.get("value") and float(cb["value"]) > 0 else ""
+            lines.append(f"  {i}. {cb['name']}{w}")
+        prompt = "\n".join(lines)
+        return prompt, len(prompt), True, rubric_name, is_form, len(crit_blocks), len(levels)
 
-    # Absolute fallback: names and weights only
-    lines = [f"Please create a rubric titled: {rubric_name}", ""]
-    if levels:
-        lines.append(f"Rubric type: Percentage-based, {len(levels)} levels "
-                     f"from {levels[0]} to {levels[-1]}.")
-        lines.append("")
-    lines.append(f"The rubric must have exactly {len(crit_blocks)} criteria:")
-    lines.append("")
-    for i, cb in enumerate(crit_blocks, 1):
-        w = f" ({int(float(cb['value']))}%)" if cb["value"] and float(cb["value"]) > 0 else ""
-        lines.append(f"{i}. {cb['name']}{w} — {cb['desc']}")
-    lines.append("")
-    lines.append("Important: Use exactly the criteria names and weightings listed above.")
-    prompt = "\n".join(lines)
-    return prompt, len(prompt), True, rubric_name, is_form, len(crit_blocks), len(levels)
+    # Step 2: binary search for the largest descriptor budget that fits
+    remaining = char_limit - len(base_prompt)
+    n_with_descs = sum(1 for cb in crit_blocks if cb.get("dist") or cb.get("fail"))
+
+    if remaining > 60 and n_with_descs > 0:
+        lo, hi = 0, remaining
+        best_prompt = base_prompt
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = _build_prompt(
+                rubric_name, rubric_desc, is_form, levels, crit_blocks,
+                char_limit, include_descs=True, chars_per_criterion=mid
+            )
+            if len(candidate) <= char_limit:
+                best_prompt = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        prompt = best_prompt
+    else:
+        prompt = base_prompt
+
+    compressed = len(prompt) < char_limit * 0.85
+    return prompt, len(prompt), compressed, rubric_name, is_form, len(crit_blocks), len(levels)
 
 
 def save_prompt(filepath, output_dir=None, char_limit=CHAR_LIMIT):
