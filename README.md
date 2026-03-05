@@ -125,7 +125,7 @@ The `examples/` folder contains sample `.rbc` files you can use to test the tool
 
 ## Development notes
 
-This tool was developed to support a Turnitin-to-Blackboard Ultra migration project, and written with the assistance of [Claude](https://claude.ai) (Anthropic). It is shared here in the hope it is useful to others facing the same challenge.
+This tool was developed to support a Turnitin-to-Blackboard Ultra migration project, and written with the help of AI coding assistants. It is shared here in the hope it is useful to others facing the same challenge.
 
 ---
 
