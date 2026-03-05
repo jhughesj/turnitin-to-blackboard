@@ -6,8 +6,7 @@
 **Smart sentence extraction**
 Replaced sequential sentence selection with scored extraction — sentences containing specific,
 checkable requirements (referencing styles, named requirements, institutional specifics) are now prioritised over generic quality prose regardless of their position in the descriptor
-Added _HIGH_VALUE_SIGNALS list (+10 each): Harvard/APA/MLA/Chicago/Vancouver, bibliography, peer-reviewed, primary source, plagiarism, similarity score, originality, AI-generated content, word count/limit, template, supervisor, 
-Westminster, UN SDGs, GDPR, data protection, knowledge gap, statistical, lay/expert audience, and more
+Added _HIGH_VALUE_SIGNALS list (+10 each): Harvard/APA/MLA/Chicago/Vancouver, bibliography, peer-reviewed, primary source, plagiarism, similarity score, originality, AI-generated content, word count/limit, template, supervisor, UN SDGs, GDPR, data protection, knowledge gap, statistical, lay/expert audience, and more
 
 Added _MEDIUM_VALUE_SIGNALS list (+8 each): images, visuals, diagrams, figures, charts, screenshots
 Added _GENERIC_OPENERS penalty list (-3): suppresses generic quality sentences that add no information value
